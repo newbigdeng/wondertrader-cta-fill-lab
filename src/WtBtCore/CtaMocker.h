@@ -10,8 +10,10 @@
 #pragma once
 #include <sstream>
 #include <atomic>
+#include <memory>
 #include <unordered_map>
 #include "HisDataReplayer.h"
+#include "CtaFillModel.h"  // CTA 回测内部成交决策接口；不属于对外 Porter ABI
 
 #include "../Includes/FasterDefs.h"
 #include "../Includes/ICtaStraCtx.h"
@@ -80,7 +82,13 @@ private:
 
 	void	update_dyn_profit(const char* stdCode, double price);
 
+	// 信号消费入口：选取基准价、构造 FillRequest，并处理 NoChange/InvalidInput。
+	// 这里不直接写交易明细；实际记账交给 apply_fill。
 	void	do_set_position(const char* stdCode, double qty, double price = 0.0, const char* userTag = "");
+	// 保留旧 do_set_position 的会计流程：开平拆分、滑点、费用、盈亏、持仓与日志。
+	// 当前仍按完整目标 qty 更新仓位，因此仅替换决策类还不能支持部分成交。
+	void	apply_fill(const char* stdCode, double qty, const char* userTag,
+		uint64_t curTm, uint32_t curTDate, const FillResult& fill);
 	void	append_signal(const char* stdCode, double qty, const char* userTag, double price, uint32_t sigType);
 
 	inline CondList& get_cond_entrusts(const char* stdCode);
@@ -246,6 +254,9 @@ protected:
 
 	int32_t			_slippage;			//成交滑点， 如果是比例滑点，则为万分比
 	bool			_ratio_slippage;	//是否比例滑点
+	// 模型由上下文独占；构造时创建一次 LegacyCtaFill，每次信号复用同一实例。
+	// 目前没有从 Python/配置文件切换模型的入口，也不会在每个 Tick 上分配模型。
+	std::unique_ptr<ICtaFillModel> _fill_model;
 
 	uint32_t		_schedule_times;	//调度次数
 

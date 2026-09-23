@@ -55,6 +55,8 @@ inline uint32_t makeCtxId()
 }
 
 
+// 每个 CTA 回测上下文只持有一个默认 Legacy 模型；模型在构造时创建，
+// 后续行情与信号复用同一实例，不会在每个 Tick 上重复分配。
 CtaMocker::CtaMocker(HisDataReplayer* replayer, const char* name, int32_t slippage /* = 0 */, bool persistData /* = true */, EventNotifier* notifier /* = NULL */, bool isRatioSlp /* = false */)
 	: ICtaStraCtx(name)
 	, _replayer(replayer)
@@ -65,6 +67,7 @@ CtaMocker::CtaMocker(HisDataReplayer* replayer, const char* name, int32_t slippa
 	, _strategy(NULL)
 	, _slippage(slippage)
 	, _ratio_slippage(isRatioSlp)
+	, _fill_model(new LegacyCtaFill())
 	, _schedule_times(0)
 	, _total_closeprofit(0)
 	, _notifier(notifier)
@@ -1598,28 +1601,66 @@ void CtaMocker::append_signal(const char* stdCode, double qty, const char* userT
 	//save_data();
 }
 
+// 消费已生成的目标仓位信号时调用。此处只准备决策输入；
+// 原版交易明细、费用和资金处理已留在 apply_fill，不在模型内发生。
 void CtaMocker::do_set_position(const char* stdCode, double qty, double price /* = 0.0 */, const char* userTag /* = "" */)
 {
+	// operator[] 在该合约第一次交易时建立默认 PosInfo，与原版调用顺序相同。
 	PosInfo& pInfo = _pos_map[stdCode];
+	// 非零 price 通常来自信号保存的指定价；零价则回退到上下文价格表。
+	// curPx 只是未加滑点的基准价，不等同于最终成交价。
 	double curPx = price;
 	if (decimal::eq(price, 0.0))
 		curPx = _price_map[stdCode];
 	uint64_t curTm = (uint64_t)_replayer->get_date() * 10000 + _replayer->get_min_time();
 	uint32_t curTDate = _replayer->get_trading_date();
 
-	//手数相等则不用操作了
-	if (decimal::eq(pInfo._volume, qty))
-		return;
+	// 把当前策略持仓、目标仓位和已经选好的基准价交给纯决策模型。
+	// 当前快照只填少数字段：last 暂等于 curPx，不保证是真实 Tick 最新价；
+	// 买卖盘口、量与事件序号未填，不能据此假设已支持盘口撮合。
+	FillRequest request;
+	request.actual_position = pInfo._volume;
+	request.target_position = qty;
+	request.base_price = curPx;
+	request.market.code = stdCode;
+	request.market.trading_date = curTDate;
+	request.market.last = curPx;
+	const FillResult fill = _fill_model->decide(request);
 
+	// 仓位在 decimal::eq 容差内不变，沿用原版“直接返回、不记账”的处理。
+	if (fill.status == FillStatus::NoChange)
+		return;
+	// 非有限数输入会被新模型拒绝；这是相对未校验的原版唯一明确的边界变化。
+	if (fill.status == FillStatus::InvalidInput)
+	{
+		log_error("invalid CTA fill input for {}", stdCode);
+		return;
+	}
+
+	// 决策只给出有符号差额和基准价；真正的成交、滑点和会计副作用在下方。
+	apply_fill(stdCode, qty, userTag, curTm, curTDate, fill);
+}
+#pragma region apply_fill
+// 这一段由原 do_set_position 的记账主体抽出，仍维持原分支和计算顺序。
+// Filled 表示“回测中准备按此数量立即记账”，不是外部交易通道的成交回报。
+// 本函数仍直接把 pInfo._volume 设成完整目标 qty，尚不支持部分成交。
+void CtaMocker::apply_fill(const char* stdCode, double qty, const char* userTag,
+	uint64_t curTm, uint32_t curTDate, const FillResult& fill)
+{
+	PosInfo& pInfo = _pos_map[stdCode];
+	// 与原版相同：找不到合约品种信息就无法获得价格跳动、乘数和费率，直接返回。
 	WTSCommodityInfo* commInfo = _replayer->get_commodity_info(stdCode);
 	if (commInfo == NULL)
 		return;
 
-	//成交价
-	double trdPx = curPx;
+	// 从模型传回的基准价起算；下面按买卖方向叠加滑点得到最终记账价。
+	double trdPx = fill.base_price;
 
-	double diff = qty - pInfo._volume;
+	// 差额为正表示买入，为负表示卖出；它尚未区分“开”还是“平”。
+	double diff = fill.signed_delta;
 	bool isBuy = decimal::gt(diff, 0.0);
+	// 仅旧仓非零且增量与旧仓同向时走加仓分支。
+	// 旧仓为零时乘积为零，会进入下方 else 并在“剩余量”分支新开仓。
 	if (decimal::gt(pInfo._volume*diff, 0))//当前持仓和仓位变化方向一致, 增加一条明细, 增加数量即可
 	{
 		pInfo._volume = qty;
@@ -1632,6 +1673,8 @@ void CtaMocker::do_set_position(const char* stdCode, double qty, double price /*
 			log_debug("{} frozen position up to {}", stdCode, pInfo._frozen);
 		}
 		
+		// 固定滑点按价格跳动数计算；比例滑点按万分比计算后修正到价格跳动。
+		// 买入抬高记账价、卖出压低记账价；模型自身尚未处理滑点。
 		if (_slippage != 0)
 		{
 			if (_ratio_slippage)
@@ -1648,6 +1691,7 @@ void CtaMocker::do_set_position(const char* stdCode, double qty, double price /*
 				trdPx += _slippage * commInfo->getPriceTick()*(isBuy ? 1 : -1);
 		}
 
+		// 加仓产生新的持仓明细，并保存本次开仓价、数量、时间与策略标签。
 		DetailInfo dInfo;
 		dInfo._long = decimal::gt(qty, 0);
 		dInfo._price = trdPx;
@@ -1661,14 +1705,17 @@ void CtaMocker::do_set_position(const char* stdCode, double qty, double price /*
 		pInfo._details.emplace_back(dInfo);
 		pInfo._last_entertime = curTm;
 
+		// 开仓费由回放器根据品种费率计算；成交记录和资金累计仍在旧路径中写入。
 		double fee = _replayer->calc_fee(stdCode, trdPx, abs(diff), 0);
 		_fund_info._total_fees += fee;
 
 		log_trade(stdCode, dInfo._long, true, curTm, trdPx, abs(diff), userTag, fee, _schedule_times);
 	}
 	else
-	{//持仓方向和仓位变化方向不一致,需要平仓
+	{// 旧仓与增量不同向，或旧仓为零：先消耗旧明细，仍有余量再开新方向。
+		// left 是尚未分配的绝对成交量；空仓开仓时没有旧明细可平。
 		double left = abs(diff);
+		// 减仓、平仓、反手也只对同一个基准价应用一次原版滑点。
 		if (_slippage != 0)
 		{
 			if (_ratio_slippage)
@@ -1688,6 +1735,7 @@ void CtaMocker::do_set_position(const char* stdCode, double qty, double price /*
 		pInfo._volume = qty;
 		if (decimal::eq(pInfo._volume, 0))
 			pInfo._dynprofit = 0;
+		// 按已有持仓明细的顺序逐条抵扣；一笔目标变化可能产生多条平仓记录。
 		uint32_t count = 0;
 		for (auto it = pInfo._details.begin(); it != pInfo._details.end(); it++)
 		{
@@ -1705,6 +1753,8 @@ void CtaMocker::do_set_position(const char* stdCode, double qty, double price /*
 			if (decimal::eq(dInfo._volume, 0))
 				count++;
 
+			// 平仓盈亏按成交价差、平仓量和合约乘数计算；空头方向取反。
+			// 同时更新明细、策略已实现盈亏和资金累计，不由 FillResult 承担。
 			double profit = (trdPx - dInfo._price) * maxQty * commInfo->getVolScale();
 			if (!dInfo._long)
 				profit *= -1;
@@ -1714,6 +1764,8 @@ void CtaMocker::do_set_position(const char* stdCode, double qty, double price /*
 			pInfo._last_exittime = curTm;
 			_fund_info._total_profit += profit;
 
+			// 原版用费率标志 2/1 区分同交易日与非同交易日平仓。
+			// log_trade 与 log_close 分别形成成交记录和平仓盈亏记录。
 			double fee = _replayer->calc_fee(stdCode, trdPx, maxQty, dInfo._opentdate == curTDate ? 2 : 1);
 			_fund_info._total_fees += fee;
 			//这里写成交记录
@@ -1734,7 +1786,8 @@ void CtaMocker::do_set_position(const char* stdCode, double qty, double price /*
 			count--;
 		}
 
-		//最后,如果还有剩余的,则需要反手了
+		// 抵扣旧明细后仍有余量时开新仓：既覆盖反手，也覆盖从空仓开仓。
+		// 新仓继续使用上面已经加过滑点的 trdPx，不会再次叠加滑点。
 		if (left > 0)
 		{
 			left = left * qty / abs(qty);
