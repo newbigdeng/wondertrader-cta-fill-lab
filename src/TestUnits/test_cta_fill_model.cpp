@@ -104,3 +104,117 @@ TEST(LegacyCtaFill, RejectsNonFiniteInputs)
 	request.base_price = std::numeric_limits<double>::infinity();
 	EXPECT_TRUE(model.decide(request).status == FillStatus::InvalidInput);
 }
+
+// Day12 的模型测试只验证因果门槛与 touch 取价，不把 Filled 解释为交易所回报。
+// 创建序号和行情序号由回放器推进；同一 Tick 内两次 proc_tick 不应推进两次。
+namespace
+{
+FillRequest causal_request(double actual, double target, uint64_t created, uint64_t market)
+{
+	FillRequest request = request_for(actual, target, 100.0);
+	request.created_sequence = created;
+	request.market.event_sequence = market;
+	request.source = SignalSource::StrategyTick;
+	request.market.bid1 = 99.0;
+	request.market.ask1 = 101.0;
+	return request;
+}
+}
+
+TEST(CausalTouchFill, SameEventMustWait)
+{
+	CausalTouchFill model;
+	const FillResult result = model.decide(causal_request(0.0, 2.0, 100, 100));
+	EXPECT_TRUE(result.status == FillStatus::WaitingLatency);
+	EXPECT_DOUBLE_EQ(0.0, result.signed_delta);
+}
+
+TEST(CausalTouchFill, NextEventBuyUsesAskTouch)
+{
+	CausalTouchFill model;
+	const FillResult result = model.decide(causal_request(0.0, 2.0, 100, 101));
+	EXPECT_TRUE(result.status == FillStatus::Filled);
+	EXPECT_DOUBLE_EQ(2.0, result.signed_delta);
+	EXPECT_DOUBLE_EQ(101.0, result.base_price);
+}
+
+TEST(CausalTouchFill, NextEventSellUsesBidTouch)
+{
+	CausalTouchFill model;
+	const FillResult result = model.decide(causal_request(0.0, -2.0, 100, 101));
+	EXPECT_TRUE(result.status == FillStatus::Filled);
+	EXPECT_DOUBLE_EQ(-2.0, result.signed_delta);
+	EXPECT_DOUBLE_EQ(99.0, result.base_price);
+}
+
+TEST(CausalTouchFill, ConfiguredDelayCountsAdditionalEvents)
+{
+	CausalTouchFill model(2);
+	EXPECT_TRUE(model.decide(causal_request(0.0, 1.0, 100, 102)).status == FillStatus::WaitingLatency);
+	EXPECT_TRUE(model.decide(causal_request(0.0, 1.0, 100, 103)).status == FillStatus::Filled);
+}
+
+TEST(CausalTouchFill, MissingEitherSideIsNoQuote)
+{
+	CausalTouchFill model;
+	FillRequest request = causal_request(0.0, 1.0, 100, 101);
+	request.market.ask1 = 0.0;
+	EXPECT_TRUE(model.decide(request).status == FillStatus::NoQuote);
+	request = causal_request(0.0, -1.0, 100, 101);
+	request.market.bid1 = 0.0;
+	EXPECT_TRUE(model.decide(request).status == FillStatus::NoQuote);
+}
+
+TEST(CausalTouchFill, BadOrCrossedBookIsRejected)
+{
+	CausalTouchFill model;
+	FillRequest request = causal_request(0.0, 1.0, 100, 101);
+	request.market.bid1 = 102.0;
+	EXPECT_TRUE(model.decide(request).status == FillStatus::InvalidMarketData);
+	request = causal_request(0.0, 1.0, 100, 101);
+	request.market.ask1 = std::numeric_limits<double>::quiet_NaN();
+	EXPECT_TRUE(model.decide(request).status == FillStatus::InvalidMarketData);
+}
+
+TEST(CausalTouchFill, NoQuoteCanFillOnLaterValidEvent)
+{
+	CausalTouchFill model;
+	FillRequest request = causal_request(0.0, 1.0, 100, 101);
+	request.market.ask1 = 0.0;
+	EXPECT_TRUE(model.decide(request).status == FillStatus::NoQuote);
+	request = causal_request(0.0, 1.0, 100, 102);
+	EXPECT_TRUE(model.decide(request).status == FillStatus::Filled);
+	EXPECT_DOUBLE_EQ(101.0, model.decide(request).base_price);
+}
+
+TEST(CausalTouchFill, ReplacedTargetResetsCausalClock)
+{
+	CausalTouchFill model;
+	// 新目标在事件 101 才产生，不能沿用被覆盖目标的创建序号 100。
+	EXPECT_TRUE(model.decide(causal_request(0.0, 3.0, 101, 101)).status == FillStatus::WaitingLatency);
+	const FillResult result = model.decide(causal_request(0.0, 3.0, 101, 102));
+	EXPECT_TRUE(result.status == FillStatus::Filled);
+	EXPECT_DOUBLE_EQ(3.0, result.signed_delta);
+}
+
+// run_by_bars 先模拟 Tick，再执行 onMinuteEnd -> handle_schedule。
+// 因此调度目标记在事件 100 后，事件 101 是它遇到的第一笔可处理行情。
+TEST(CausalTouchFill, BarCloseScheduleUsesNextReplayEvent)
+{
+	CausalTouchFill model;
+	FillRequest request = causal_request(0.0, 1.0, 100, 101);
+	request.source = SignalSource::Schedule;
+	EXPECT_TRUE(model.decide(request).status == FillStatus::Filled);
+}
+
+// on_tick_updated 在前后两次 proc_tick 之间；后一次仍是同一个事件 100。
+// 仅事件 101 才能使回调生成的目标满足因果等待门槛。
+TEST(CausalTouchFill, PostCallbackProcTickDoesNotAdvanceEvent)
+{
+	CausalTouchFill model;
+	FillRequest request = causal_request(0.0, 1.0, 100, 100);
+	request.source = SignalSource::StrategyTick;
+	EXPECT_TRUE(model.decide(request).status == FillStatus::WaitingLatency);
+	request.market.event_sequence = 101;
+	EXPECT_TRUE(model.decide(request).status == FillStatus::Filled);
+}

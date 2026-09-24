@@ -82,9 +82,10 @@ private:
 
 	void	update_dyn_profit(const char* stdCode, double price);
 
-	// 信号消费入口：选取基准价、构造 FillRequest，并处理 NoChange/InvalidInput。
-	// 这里不直接写交易明细；实际记账交给 apply_fill。
-	void	do_set_position(const char* stdCode, double qty, double price = 0.0, const char* userTag = "");
+	// 信号消费入口：把目标创建序号、来源和当前 Tick 盘口交给模型。
+	// WaitingLatency/NoQuote/InvalidMarketData 不记账，调用者保留信号继续等待。
+	FillStatus do_set_position(const char* stdCode, double qty, double price,
+		const char* userTag, uint64_t created_sequence, SignalSource source);
 	// 保留旧 do_set_position 的会计流程：开平拆分、滑点、费用、盈亏、持仓与日志。
 	// 当前仍按完整目标 qty 更新仓位，因此仅替换决策类还不能支持部分成交。
 	void	apply_fill(const char* stdCode, double qty, const char* userTag,
@@ -97,6 +98,8 @@ private:
 
 public:
 	bool	init_cta_factory(WTSVariant* cfg);
+	// 仅供 C++ 内部配置和 YAML 的 cta.model 使用；默认仍为 legacy_cta。
+	bool	configure_fill_model(const char* model, uint64_t delay_events = 0);
 	void	load_incremental_data(const char* lastBacktestName);
 	void	install_hook();
 	void	enable_hook(bool bEnabled = true);
@@ -254,9 +257,10 @@ protected:
 
 	int32_t			_slippage;			//成交滑点， 如果是比例滑点，则为万分比
 	bool			_ratio_slippage;	//是否比例滑点
-	// 模型由上下文独占；构造时创建一次 LegacyCtaFill，每次信号复用同一实例。
-	// 目前没有从 Python/配置文件切换模型的入口，也不会在每个 Tick 上分配模型。
+	// 模型由上下文独占，且只在配置时构造，不会在每个 Tick 上分配。
 	std::unique_ptr<ICtaFillModel> _fill_model;
+	uint64_t _event_sequence = 0; // 每次 handle_tick 增一次；同事件双 proc_tick 不重复增
+	bool _in_tick_callback = false; // 仅用于标记 append_signal 的来源
 
 	uint32_t		_schedule_times;	//调度次数
 
@@ -335,6 +339,8 @@ protected:
 		double		_desprice;
 		uint32_t	_sigtype;
 		uint64_t	_gentime;
+		uint64_t	_created_sequence; // 最新目标的回放事件序号，非墙钟
+		SignalSource _source;        // 产生目标的回调/条件来源
 
 		_SigInfo()
 		{
@@ -343,6 +349,8 @@ protected:
 			_desprice = 0;
 			_sigtype = 0;
 			_gentime = 0;
+			_created_sequence = 0;
+			_source = SignalSource::Unknown;
 		}
 	}SigInfo;
 	typedef wt_hashmap<std::string, SigInfo>	SignalMap;

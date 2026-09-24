@@ -476,8 +476,15 @@ void WtBtRunner::config(const char* cfgFile, bool isFile /* = true */)
 		const char* name = cfgMode->getCString("name");
 		int32_t slippage = cfgMode->getInt32("slippage");
 		_cta_mocker = new ExpCtaMocker(&_replayer, name, slippage, &_notifier);
-		_cta_mocker->init_cta_factory(cfgMode);
-		_replayer.register_sink(_cta_mocker, name);
+		// 不能忽略配置/策略工厂初始化失败，否则无效 model 会悄悄以 Legacy 运行。
+		if (_cta_mocker->init_cta_factory(cfgMode))
+			_replayer.register_sink(_cta_mocker, name);
+		else
+		{
+			WTSLogger::error("CTA mocker configuration or strategy factory initialization failed");
+			delete _cta_mocker;
+			_cta_mocker = NULL;
+		}
 	}
 	else if (strcmp(mode, "hft") == 0 && cfgMode)
 	{
