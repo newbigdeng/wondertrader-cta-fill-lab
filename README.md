@@ -1,35 +1,34 @@
-# WonderTrader CTA 回测成交模型实验
+# WonderTrader CTA 回测成交模型
 
-> 这是基于 [WonderTrader 原版](https://github.com/wondertrader/wondertrader) 的个人二次开发仓库，**不是 WonderTrader 官方项目**。原版框架、主要架构和绝大多数源码由原项目作者贡献；我在此基础上修改的是 CTA 回测的成交环节。Python 侧的配套修改见 [wtpy-cta-fill-lab](https://github.com/newbigdeng/wtpy-cta-fill-lab)。原项目及本仓库的许可见 [LICENSE](LICENSE)。
+这个仓库是在 [WonderTrader 原版](https://github.com/wondertrader/wondertrader) 上做的二次开发，不是 WT 官方仓库。WT 原有的行情、策略引擎、执行器、交易通道和回测框架都来自原项目。我改的是 **CTA 回测里目标仓位到模拟成交** 这一段，以及围绕它做的测试。Python 侧的改动在 [wtpy-cta-fill-lab](https://github.com/newbigdeng/wtpy-cta-fill-lab)。
 
-## 原版框架做什么
+## 原版 WT 是怎么跑的
 
-WonderTrader 是以 C++ 为核心的量化交易框架。原版已经提供行情接入与存储、CTA/SEL/HFT/UFT 等策略引擎、目标仓位到执行与交易接口的链路，以及历史数据回放和回测能力；[wtpy 原版](https://github.com/wondertrader/wtpy)提供 Python 策略接口和应用层组件。这些能力不是本仓库从零实现的。
+先看实盘/仿真盘。行情接口收到数据后，`ParserAdapter` 统一代码并交给引擎；引擎驱动策略、汇总目标仓位，再把目标交给执行器。执行单元决定报单节奏和价格，`TraderAdapter` 管交易通道的订单、持仓和资金状态。末端接真实交易接口就是实盘，接 `TraderMocker` 就是本地仿真撮合。两者共用上面的执行链。
 
-按源码目录看，主要模块可以这样理解：
+![WT 原版实盘与仿真盘主链路](images/wt-live-sim-architecture.png)
 
-| 原版模块 | 职责 |
-| --- | --- |
-| `src/Parser*`、`src/WtDtCore`、`src/WtDataStorage` | 行情接入、数据管理与存储 |
-| `src/WtCore`、`src/WtRunner`、`src/WtUftCore` | 策略上下文与交易引擎运行 |
-| `src/WtExecMon`、`src/WtExeFact`、`src/Trader*` | 目标仓位执行与交易通道对接 |
-| `src/WtBtCore`、`src/WtBtPorter` | 历史行情回放、回测记账及对外接口 |
+图里把跨层调用压成了三行，省略了订单/成交回报箭头：回报会返回 `TraderAdapter`，再通知执行器。`TraderMocker` 的撮合逻辑在它自身及其配套实现里，图中的“Local simulated matching”不是另一套独立服务。数据中台 `WtDtCore`/`WtDtServo`、历史存储 `WtDataStorage`、Python 桥接 `WtPorter`/`WtRtRunner`，以及 `EventNotifier`/`WtMsgQue` 到 wtpy 监控端，是旁路或可选部署，不是每个 Tick 必经的主链。
 
-CTA 回测的一条主要路径是：历史行情由 `HisDataReplayer` 回放，`CtaMocker` 驱动策略、处理目标仓位并记录模拟成交和盈亏，`WtBtPorter` 向应用层提供接口。它与原版实盘的执行器、交易适配器、柜台委托回报链路不同。
+这里的“组合管理”主要指引擎汇总多策略目标、路由到执行器；资金盈亏记账在引擎，交易账户资金状态在 `TraderAdapter`。原版已有过滤、仓位缩放和风险监控等机制，但不应把它们理解为独立的通用风控服务。[原版实盘架构图](images/prod_struture.png)也保留在仓库里。
 
-## 我的二次开发：先简述
+CTA 回测走另一条链：`HisDataReplayer` 回放历史数据，`CtaMocker` 驱动策略、维护模拟仓位和盈亏，不经过上图的 `TraderAdapter`/`TraderMocker`。下面这张是原版 README 的回测架构图，更多背景可看 [WT 上游仓库](https://github.com/wondertrader/wondertrader)。
 
-**我没有重写 WonderTrader；我把 CTA 回测中“目标仓位如何变成实际成交”这一段抽成可替换的成交模型，再逐步加入行情约束、部分成交和回归验证。**当前修改范围是 CTA 回测，不应把实验成交模型等同于真实市场成交。
+![WonderTrader 原版回测架构](images/backtest.jpg)
 
-- **Day11–13：抽出成交环节。**`LegacyCtaFill` 保留原版“信号直接按目标全量成交”的基线行为；`CausalTouchFill` 引入事件顺序和对手盘报价约束，并接入模型配置与待成交目标状态。这个阶段的因果模型仍是全量成交。
-- **Day14：建立动态检测环境。**用 Debug 构建和 ASan/UBSan 辅助检查成交模型改动。
-- **Day15–16：加入成交量约束。**`VolumeLimitedFill` 按真实 Tick 成交量与参与率限制单次可成交量，支持部分成交；事件预算和目标状态分别负责避免同一 Tick 成交量重复使用、避免把旧目标的差额叠加到新目标。
-- **Day17–21：验证功能和边界。**增加单元测试、真实 Tick 会计与目标覆盖验收，并在固定目标和策略反馈两层做单日成交假设敏感性实验。实验结果只说明该样本对成交假设敏感，不代表实盘收益。
+我改动的部分在 CTA 回测路径上。下图只画与这次改动有关的节点，省略了其他策略引擎和实盘执行链；`CtaFillModel` 给出成交决策，实际改仓位、记账和写 CSV 仍由 `CtaMocker` 完成。
 
-实现入口可从 [`CtaFillModel.h`](src/WtBtCore/CtaFillModel.h)、[`CtaMocker.cpp`](src/WtBtCore/CtaMocker.cpp) 和 [`test_cta_fill_model.cpp`](src/TestUnits/test_cta_fill_model.cpp) 开始阅读。Python 参数入口与实验脚本在配套的 [wtpy 仓库](https://github.com/newbigdeng/wtpy-cta-fill-lab)。
+![本仓库 CTA 回测成交路径](images/cta-backtest-architecture.png)
 
-## 原版与归属
+## 我改了什么
 
-- 原版 C++ 仓库：[wondertrader/wondertrader](https://github.com/wondertrader/wondertrader)
-- 原版 Python 子框架：[wondertrader/wtpy](https://github.com/wondertrader/wtpy)
-- 本仓库保留上游许可和 Git 历史；上面列出的二次开发内容才是我在本项目中的工作。
+原来的 CTA 回测在处理目标仓位时，基本按目标与当前仓位的差额直接成交。这种做法很适合作基线，但没法观察“只成交一部分”会怎样影响后面的策略信号。我想保持策略不变、单独替换成交规则，于是把成交判断从 `CtaMocker` 中拆了出来，并留下保持原行为的 `LegacyCtaFill` 作对照。
+
+- `CausalTouchFill` 按事件顺序和对手盘报价判断能否成交。这个模型仍是全量成交；没有可用报价时不会编造一个成交价。
+- `VolumeLimitedFill` 根据 Tick 成交量和参与率限制本次可成交手数，允许部分成交。一个 Tick 的量不能被同一事件里的多次尝试重复使用。
+- 待成交信号保存最新**目标仓位**，剩余量每次用“目标 − 实际仓位”重算。目标被覆盖时，不会把旧目标的未成交量叠到新目标上。
+- 增加成交决策、实际成交和目标覆盖的审计输出，并用单元测试、Legacy 输出对照和真实 Tick 回测检查数量、费用、反手与目标取消等边界。
+
+核心代码在 [`CtaFillModel.h`](src/WtBtCore/CtaFillModel.h)、[`CtaMocker.cpp`](src/WtBtCore/CtaMocker.cpp) 和 [`test_cta_fill_model.cpp`](src/TestUnits/test_cta_fill_model.cpp)。目前这些改动只用于 CTA 回测；模型里的“成交”是回测记账，不是交易所委托回报。
+
+原版项目：[WonderTrader](https://github.com/wondertrader/wondertrader) · [wtpy](https://github.com/wondertrader/wtpy)。本仓库保留原项目的 [MIT 许可](LICENSE) 与 Git 历史。
