@@ -265,8 +265,10 @@ void WtBtRunner::registerHftCallbacks(FuncStraInitCallback cbInit, FuncStraTickC
 	WTSLogger::info("Callbacks of HFT engine registration done");
 }
 
-uint32_t WtBtRunner::initCtaMocker(const char* name, int32_t slippage /* = 0 */, bool hook /* = false */, 
-	bool persistData /* = true */, bool bIncremental /* = false */, bool isRatioSlp /* = false */)
+uint32_t WtBtRunner::initCtaMocker(const char* name, int32_t slippage /* = 0 */, bool hook /* = false */,
+	bool persistData /* = true */, bool bIncremental /* = false */, bool isRatioSlp /* = false */,
+	const char* fillModel /* = "legacy_cta" */, uint64_t eventDelay /* = 0 */,
+	double participationRate /* = 0.0 */)
 {
 	if(_cta_mocker)
 	{
@@ -275,6 +277,13 @@ uint32_t WtBtRunner::initCtaMocker(const char* name, int32_t slippage /* = 0 */,
 	}
 
 	_cta_mocker = new ExpCtaMocker(&_replayer, name, slippage, persistData, &_notifier, isRatioSlp);
+	// 在加载增量状态和注册 sink 前完成校验；无效配置不能悄悄退回 Legacy。
+	if (!_cta_mocker->configure_fill_model(fillModel, eventDelay, participationRate))
+	{
+		delete _cta_mocker;
+		_cta_mocker = NULL;
+		return 0;
+	}
 	if (bIncremental)
 	{
 		_cta_mocker->load_incremental_data(name);

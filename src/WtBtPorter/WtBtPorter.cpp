@@ -169,6 +169,21 @@ CtxHandler init_cta_mocker(const char* name, int slippage/* = 0*/, bool hook/* =
 	return getRunner().initCtaMocker(name, slippage, hook, persistData, bIncremental, bRatioSlp);
 }
 
+CtxHandler init_cta_mocker_v2(const char* name, int slippage, bool hook,
+	bool persistData, bool bIncremental, bool bRatioSlp, const char* fillModel, WtUInt64 eventDelay)
+{
+	return getRunner().initCtaMocker(name, slippage, hook, persistData, bIncremental,
+		bRatioSlp, fillModel, eventDelay);
+}
+
+CtxHandler init_cta_mocker_v3(const char* name, int slippage, bool hook,
+	bool persistData, bool bIncremental, bool bRatioSlp, const char* fillModel,
+	WtUInt64 eventDelay, double participationRate)
+{
+	return getRunner().initCtaMocker(name, slippage, hook, persistData, bIncremental,
+		bRatioSlp, fillModel, eventDelay, participationRate);
+}
+
 CtxHandler init_hft_mocker(const char* name, bool hook/* = false*/)
 {
 	return getRunner().initHftMocker(name, hook);

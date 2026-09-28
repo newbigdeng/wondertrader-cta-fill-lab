@@ -739,6 +739,9 @@ void HisDataReplayer::run(bool bNeedDump/* = false*/)
 void HisDataReplayer::run_by_ticks(bool bNeedDump /* = false */)
 {
 	//如果没有订阅K线，且tick回测是打开的，则按照每日的tick进行回放
+	// 该分支只会逐笔播放真实 Tick，不能沿用 reset() 的“模拟 Tick”默认值。
+	// 否则 CTA 因果/限量模型会把有效 bid/ask 当成模拟盘口而一直拒绝成交。
+	_tick_simulated = false;
 	uint32_t edt = (uint32_t)(_end_time / 10000);
 	uint32_t etime = (uint32_t)(_end_time % 10000);
 	uint64_t end_tdate = _bd_mgr.calcTradingDate(DEFAULT_SESSIONID, edt, etime, true);
@@ -1843,6 +1846,8 @@ uint64_t HisDataReplayer::replayHftDatasByDay(uint32_t curTDate)
 				update_price(stdCode, nextTick.price);
 				WTSTickData* newTick = WTSTickData::create(nextTick);
 				newTick->setCode(stdCode);
+				// 标志必须在回调前更新；调用方要等本函数返回才设置标志，太晚。
+				_tick_simulated = false;
 				_listener->handle_tick(stdCode, newTick, 0);
 				newTick->release();
 				
@@ -1957,6 +1962,8 @@ bool HisDataReplayer::replayHftDatas(uint64_t stime, uint64_t etime)
 				update_price(stdCode, nextItem.price);
 				WTSTickData* newData = WTSTickData::create(nextItem);
 				newData->setCode(stdCode);
+				// 即使上一分钟曾模拟 Tick，这一笔从 .dsb 读取的仍是真实 Tick。
+				_tick_simulated = false;
 				_listener->handle_tick(stdCode, newData, 0);
 				newData->release();
 

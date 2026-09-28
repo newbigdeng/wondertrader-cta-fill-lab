@@ -12,6 +12,10 @@
 #include "EventNotifier.h"
 
 #include <exception>
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <boost/filesystem.hpp>
 
 #include "../Includes/WTSContractInfo.hpp"
@@ -57,6 +61,7 @@ inline uint32_t makeCtxId()
 
 // 每个 CTA 回测上下文只持有一个默认 Legacy 模型；模型在构造时创建，
 // 后续行情与信号复用同一实例，不会在每个 Tick 上重复分配。
+// 因此旧配置或完全不指定 fill_model 的回测仍沿用“目标差额一次成交”。
 CtaMocker::CtaMocker(HisDataReplayer* replayer, const char* name, int32_t slippage /* = 0 */, bool persistData /* = true */, EventNotifier* notifier /* = NULL */, bool isRatioSlp /* = false */)
 	: ICtaStraCtx(name)
 	, _replayer(replayer)
@@ -86,11 +91,33 @@ CtaMocker::~CtaMocker()
 {
 }
 
+uint64_t CtaMocker::current_event_sequence(const char* stdCode) const
+{
+	if (_fill_model_name == "legacy_cta")
+		return _event_sequence;
+	const auto it = _contract_event_sequences.find(stdCode);
+	return it == _contract_event_sequences.end() ? 0 : it->second;
+}
+
 void CtaMocker::dump_stradata()
 {
 	rj::Document root(rj::kObjectType);
 	// 增量回测续跑时恢复逻辑事件钟，避免 pending 信号永远等不到保存的序号。
+	// 注意：目前 Day16 的 Tick 成交量基线与事件预算账本尚未序列化；
+	// 任意事件中途恢复 volume_limited 的一致性还不能仅靠此字段保证。
 	root.AddMember("event_sequence", _event_sequence, root.GetAllocator());
+	// Day17：新增模型需要每合约时钟；全局旧字段仍保留以兼容已有快照。
+	{
+		rj::Value clocks(rj::kObjectType);
+		for (const auto& item : _contract_event_sequences)
+		{
+			rj::Value sequence;
+			sequence.SetUint64(item.second);
+			clocks.AddMember(rj::Value(item.first.c_str(), root.GetAllocator()),
+				sequence, root.GetAllocator());
+		}
+		root.AddMember("contract_event_sequences", clocks, root.GetAllocator());
+	}
 
 	{//持仓数据保存
 		rj::Value jPos(rj::kArrayType);
@@ -152,6 +179,8 @@ void CtaMocker::dump_stradata()
 	}
 
 	{//信号保存
+		// 保留的是“尚待成交的最新目标”及其创建事件，而不单是最后一次成交量。
+		// 部分成交后，目标例如仍为 10，实际仓位可以暂时只有 7。
 		rj::Value jSigs(rj::kObjectType);
 		rj::Document::AllocatorType &allocator = root.GetAllocator();
 
@@ -163,10 +192,15 @@ void CtaMocker::dump_stradata()
 			rj::Value jItem(rj::kObjectType);
 			jItem.AddMember("usertag", rj::Value(sInfo._usertag.c_str(), allocator), allocator);
 
-			jItem.AddMember("volume", sInfo._volume, allocator);
+			// 兼容旧 JSON 键名 volume；这里实际保存目标仓位，不是本 Tick 市场 volume。
+			jItem.AddMember("volume", sInfo._pending.target(), allocator);
 			jItem.AddMember("sigprice", sInfo._sigprice, allocator);
 			jItem.AddMember("gentime", sInfo._gentime, allocator);
-			jItem.AddMember("created_seq", sInfo._created_sequence, allocator);
+			// 恢复后仍能按原信号的因果时钟等待，不把旧信号当作新创建。
+			jItem.AddMember("created_seq", sInfo._pending.created_sequence(), allocator);
+			jItem.AddMember("activation_seq", sInfo._pending.activation_sequence(), allocator);
+			jItem.AddMember("target_version", sInfo._pending.version(), allocator);
+			jItem.AddMember("pending_phase", static_cast<uint32_t>(sInfo._pending.phase()), allocator);
 			jItem.AddMember("source", static_cast<uint32_t>(sInfo._source), allocator);
 
 			jSigs.AddMember(rj::Value(stdCode, allocator), jItem, allocator);
@@ -378,6 +412,25 @@ void CtaMocker::dump_outputs()
 	if (!_pos_logs.str().empty()) content += _pos_logs.str();
 	StdFile::write_file_content(filename.c_str(), (void*)content.c_str(), content.size());
 
+	// 独立审计文件不改变原版五份 CSV 的字段或顺序。decision 包括等待/拒绝；
+	// audit 只包括真正经过 apply_fill 的数量，因此可核对会计与模型决策。
+	filename = folder + "fill_decisions.csv";
+	content = "code,model,event_seq,created_seq,activation_seq,status,target,actual_before,volume_delta,volume_used,touch,execution_price\n";
+	if (!_fill_decision_logs.str().empty()) content += _fill_decision_logs.str();
+	StdFile::write_file_content(filename.c_str(), (void*)content.c_str(), content.size());
+	filename = folder + "fill_audit.csv";
+	content = "code,model,time,event_seq,created_seq,target,actual_before,actual_after,signed_qty,reference_last,reference_mid,touch_price,execution_price,spread_cost,extra_slippage\n";
+	if (!_fill_audit_logs.str().empty()) content += _fill_audit_logs.str();
+	StdFile::write_file_content(filename.c_str(), (void*)content.c_str(), content.size());
+	filename = folder + "equity_events.csv";
+	content = "code,action_date,action_time,event_seq,net_pnl,target,actual,abs_gap\n";
+	if (!_equity_event_logs.str().empty()) content += _equity_event_logs.str();
+	StdFile::write_file_content(filename.c_str(), (void*)content.c_str(), content.size());
+	filename = folder + "target_replacements.csv";
+	content = "code,event_seq,signal_time,old_target,new_target,actual_before,old_remaining\n";
+	if (!_target_replacement_logs.str().empty()) content += _target_replacement_logs.str();
+	StdFile::write_file_content(filename.c_str(), (void*)content.c_str(), content.size());
+
 	{
 		rj::Document root(rj::kObjectType);
 		rj::Document::AllocatorType &allocator = root.GetAllocator();
@@ -421,8 +474,43 @@ bool CtaMocker::init_cta_factory(WTSVariant* cfg)
 {
 	if (cfg == NULL)
 		return false;
-	// 旧配置没有 model 字段时仍使用 Legacy；event_delay 只作用于因果模型。
-	if (!configure_fill_model(cfg->getCString("model"), cfg->getUInt32("event_delay")))
+	// YAML 的 model/event_delay/participation_rate 与 Python v3 最终都进入
+	// configure_fill_model；这里负责把 YAML 文本先转换为合法的参数。
+	// WTSVariant::asUInt64 对 "-1" 会按 strtoull 转成一个极大正数；
+	// 在这里按十进制无符号整数严格解析，不能让坏配置静默等待到回测结束。
+	uint64_t delay_events = 0;
+	if (cfg->get("event_delay") != NULL)
+	{
+		const char* raw = cfg->getCString("event_delay");
+		if (raw == NULL || *raw == '\0')
+		{
+			log_error("event_delay must be an unsigned integer");
+			return false;
+		}
+		for (const char* p = raw; *p != '\0'; ++p)
+		{
+			if (*p < '0' || *p > '9')
+			{
+				log_error("event_delay must be an unsigned integer: {}", raw);
+				return false;
+			}
+		}
+		errno = 0;
+		char* end = NULL;
+		const unsigned long long parsed = std::strtoull(raw, &end, 10);
+		if (errno == ERANGE || end == raw || *end != '\0')
+		{
+			log_error("event_delay is out of range: {}", raw);
+			return false;
+		}
+		delay_events = static_cast<uint64_t>(parsed);
+	}
+	// Day16 的参与率只允许 volume_limited 使用；缺省值为 0，不影响旧配置。
+	// 示例：model: volume_limited, participation_rate: 0.1；这里的 0.1
+	// 是每 Tick 市场增量的 10%，不是盘口买一/卖一挂量的 10%。
+	const double participation_rate = cfg->get("participation_rate") == NULL
+		? 0.0 : cfg->getDouble("participation_rate");
+	if (!configure_fill_model(cfg->getCString("model"), delay_events, participation_rate))
 		return false;
 
 	const char* module = cfg->getCString("module");
@@ -459,17 +547,72 @@ bool CtaMocker::init_cta_factory(WTSVariant* cfg)
 	return true;
 }
 
-bool CtaMocker::configure_fill_model(const char* model, uint64_t delay_events)
+bool CtaMocker::configure_fill_model(const char* model, uint64_t delay_events,
+	double participation_rate)
 {
+	// 每次只装一个模型：Legacy 全量立即成交；Causal 只约束延迟/报价；
+	// VolumeLimited 在 Causal 之上再约束单 Tick 成交数量。
+	// 先验证参数、后替换模型，避免坏配置把原模型改成半初始化状态。
 	const std::string name = model == NULL ? "" : model;
+	if (!std::isfinite(participation_rate))
+	{
+		log_error("participation_rate must be finite");
+		return false;
+	}
 	if (name.empty() || name == "legacy_cta")
 	{
+		// 兼容历史回测：不给旧模型偷偷加事件延迟或参与率。
+		if (delay_events != 0 || participation_rate != 0.0)
+		{
+			log_error("legacy_cta does not accept event_delay or participation_rate");
+			return false;
+		}
 		_fill_model.reset(new LegacyCtaFill());
+		_fill_model_name = "legacy_cta";
+		_fill_delay_events = 0;
+		// 新实验不能继承上一模型的日内量源基线或已用 Tick 预算。
+		_volume_ledgers.clear();
+		_tick_volume_sources.clear();
+		_tick_input_guards.clear();
+		_contract_event_sequences.clear();
+		_event_volumes.clear();
 		return true;
 	}
 	if (name == "causal_touch")
 	{
+		// 此模型仍是全额目标差额成交，只有信号时序与 touch 价变化。
+		if (participation_rate != 0.0)
+		{
+			log_error("participation_rate requires volume_limited model");
+			return false;
+		}
 		_fill_model.reset(new CausalTouchFill(delay_events));
+		_fill_model_name = "causal_touch";
+		_fill_delay_events = delay_events;
+		_volume_ledgers.clear();
+		_tick_volume_sources.clear();
+		_tick_input_guards.clear();
+		_contract_event_sequences.clear();
+		_event_volumes.clear();
+		return true;
+	}
+	if (name == "volume_limited")
+	{
+		// 小于等于零会让预算始终为零；大于一则超过本 Tick 的市场成交量。
+		if (participation_rate <= 0.0 || participation_rate > 1.0)
+		{
+			log_error("volume_limited requires 0 < participation_rate <= 1");
+			return false;
+		}
+		_fill_model.reset(new VolumeLimitedFill(participation_rate, delay_events));
+		_fill_model_name = "volume_limited";
+		_fill_delay_events = delay_events;
+		// 此后 handle_tick 才会启用 TickVolumeSource 和 EventVolumeLedger。
+		_volume_ledgers.clear();
+		_tick_volume_sources.clear();
+		_tick_input_guards.clear();
+		_contract_event_sequences.clear();
+		_event_volumes.clear();
 		return true;
 	}
 	log_error("unknown CTA fill model: {}", name);
@@ -558,8 +701,17 @@ void CtaMocker::load_incremental_data(const char* incremental_backtest_base)
 		rj::Document d;
 		d.ParseStream(strategyDumpFile);
 		fclose(fp);
+		// 老版本 JSON 可能没有该键；存在时才恢复因果事件钟。
 		if (d.HasMember("event_sequence"))
 			_event_sequence = d["event_sequence"].GetUint64();
+		if (d.HasMember("contract_event_sequences")
+			&& d["contract_event_sequences"].IsObject())
+		{
+			for (rj::Value::ConstMemberIterator it = d["contract_event_sequences"].MemberBegin();
+				it != d["contract_event_sequences"].MemberEnd(); ++it)
+				if (it->value.IsUint64())
+					_contract_event_sequences[it->name.GetString()] = it->value.GetUint64();
+		}
 		if (d.HasMember("positions"))
 		{
 			const rj::Value& positions = d["positions"];
@@ -607,17 +759,36 @@ void CtaMocker::load_incremental_data(const char* incremental_backtest_base)
 
 		if (d.HasMember("signals"))
 		{
+			// JSON 键 volume 是“目标仓位”，不能误认为 Tick 的 volume。
+			// 旧文件可能缺少 Day13 增加的状态字段，下方使用保守默认值。
 			for (rj::Value::ConstMemberIterator itr = d["signals"].MemberBegin(); itr != d["signals"].MemberEnd(); ++itr)
 			{
 				std::string stkCode = itr->name.GetString();
 				SigInfo& sInfo = _sig_map[stkCode];
 				sInfo._usertag = itr->value["usertag"].GetString();
-				sInfo._volume = itr->value["volume"].GetDouble();
+				const double target = itr->value["volume"].GetDouble();
 				sInfo._sigprice = itr->value["sigprice"].GetDouble();
 				sInfo._gentime = itr->value["gentime"].GetUint64();
-				// 兼容 Day11 以前的状态文件；缺字段时视为本轮回放前创建。
-				if (itr->value.HasMember("created_seq"))
-					sInfo._created_sequence = itr->value["created_seq"].GetUint64();
+				// 兼容旧状态文件：缺失的因果字段采用保守默认值。
+				const uint64_t created = itr->value.HasMember("created_seq")
+					? itr->value["created_seq"].GetUint64() : 0;
+				const uint64_t activation = itr->value.HasMember("activation_seq")
+					? itr->value["activation_seq"].GetUint64()
+					: (created == std::numeric_limits<uint64_t>::max() ? created : created + 1);
+				const uint64_t version = itr->value.HasMember("target_version")
+					? itr->value["target_version"].GetUint64() : 1;
+				// 对损坏或未来版本的状态值做边界限制，避免恢复成未知状态。
+				const uint32_t phase_value = itr->value.HasMember("pending_phase")
+					? itr->value["pending_phase"].GetUint() : 1;
+				const PendingPhase phase = phase_value <= static_cast<uint32_t>(PendingPhase::WaitingLiquidity)
+					? static_cast<PendingPhase>(phase_value) : PendingPhase::WaitingLatency;
+				sInfo._pending.restore(stkCode.c_str(), target, created, activation,
+					version, phase);
+				// 老快照没有分合约计数时，用原全局计数作为保守起点，
+				// 至少避免待成交目标永远等不到 created_seq。
+				if (_fill_model_name != "legacy_cta"
+					&& _contract_event_sequences.find(stkCode) == _contract_event_sequences.end())
+					_contract_event_sequences[stkCode] = _event_sequence;
 				if (itr->value.HasMember("source"))
 					sInfo._source = static_cast<SignalSource>(itr->value["source"].GetUint());
 			}
@@ -726,6 +897,8 @@ void CtaMocker::handle_replay_done()
 
 void CtaMocker::proc_tick(const char* stdCode, double last_px, double cur_px)
 {
+	// 此函数既可能在 on_tick_updated 之前，也可能在其之后被同一 handle_tick 调用。
+	// 它负责“尝试消费”信号；是否成交由模型决定，未成交的目标留在 _sig_map。
 	{
 		auto it = _sig_map.find(stdCode);
 		if (it != _sig_map.end())
@@ -733,22 +906,37 @@ void CtaMocker::proc_tick(const char* stdCode, double last_px, double cur_px)
 			//if (sInfo->isInTradingTime(_replayer->get_raw_time(), true))
 			{
 				// 回调可能创建新信号；先复制旧目标，避免被覆盖后的引用失效。
+				// 一个合约只保存最新目标；这里处理的是进入本次调用时的快照版本。
 				const SigInfo sInfo = it->second;
 				double price;
 				if (decimal::eq(sInfo._desprice, 0.0))
 					price = cur_px;
 				else
 					price = sInfo._desprice;
-				const FillStatus status = do_set_position(stdCode, sInfo._volume, price,
-					sInfo._usertag.c_str(), sInfo._created_sequence, sInfo._source);
-				// 延迟或无有效报价时，目标保留到下一行情事件；不虚构成交价。
-				if (status != FillStatus::WaitingLatency && status != FillStatus::NoQuote
-					&& status != FillStatus::InvalidMarketData)
+				// do_set_position 可返回 WaitingLatency/NoQuote/NoLiquidity 等等待状态，
+				// 也可部分成交。它不会自行删掉未完成的目标。
+				const FillStatus status = do_set_position(stdCode, sInfo._pending.target(), price,
+					sInfo._usertag.c_str(), sInfo._pending.created_sequence(), sInfo._source);
+				// 成交回调可能改写同合约目标；只更新仍属于快照版本的状态。
+				// 若版本已变，旧决策绝不能把新目标误删或标成已完成。
+				auto current = _sig_map.find(stdCode);
+				if (current != _sig_map.end()
+					&& current->second._pending.version() == sInfo._pending.version())
 				{
-					_sig_map.erase(it);
-					// 条件触发回调只在目标完成处理后发出；等待不等于成交。
-					if (sInfo._sigtype == 2 && status != FillStatus::InvalidInput)
-						on_condition_triggered(stdCode, sInfo._volume, cur_px, sInfo._usertag.c_str());
+					const auto pos = _pos_map.find(stdCode);
+					const double actual = pos == _pos_map.end() ? 0.0 : pos->second._volume;
+					// 部分成交时 actual 仍未到目标，on_decision 会继续等待下一 Tick。
+					current->second._pending.on_decision(status, actual);
+					if (current->second._pending.phase() == PendingPhase::Idle)
+					{
+						// 仅状态机判为 Idle 才释放；NoLiquidity/部分成交不会走到这里。
+						// 当前 InvalidInput 等非等待状态也可能变 Idle，应结合日志诊断。
+						_sig_map.erase(current);
+						// 保持原条件回调时机：目标完成处理后才通知。
+						if (sInfo._sigtype == 2 && status != FillStatus::InvalidInput)
+							on_condition_triggered(stdCode, sInfo._pending.target(), cur_px,
+								sInfo._usertag.c_str());
+					}
 				}
 			}
 		}
@@ -935,8 +1123,25 @@ void CtaMocker::proc_tick(const char* stdCode, double last_px, double cur_px)
 
 void CtaMocker::handle_tick(const char* stdCode, WTSTickData* newTick, uint32_t pxType /* = 0 */)
 {
-	// 同一回放 Tick 是一个事件；前后两次 proc_tick 共享这个序号。
+	if (_fill_model_name != "legacy_cta")
+	{
+		const WTSTickStruct& input = newTick->getTickStruct();
+		if (!_tick_input_guards[stdCode].accept(input.trading_date, input.action_date,
+			input.action_time, input.total_volume, input.price,
+			input.bid_prices[0], input.ask_prices[0],
+			input.bid_qty[0], input.ask_qty[0]))
+		{
+			// 丢弃的重复/乱序输入不应消耗 Tick 延迟、预算或触发策略回调。
+			log_debug("skip duplicate/out-of-order CTA Tick for {} at {} {}",
+				stdCode, input.action_date, input.action_time);
+			return;
+		}
+	}
+	// 每收到一条回放 Tick，逻辑事件序号只加一次；它不是 action_time 毫秒值。
+	// 同一 handle_tick 前后可能两次 proc_tick，但都属于这一条输入事件。
 	++_event_sequence;
+	if (_fill_model_name != "legacy_cta")
+		++_contract_event_sequences[stdCode];
 	double cur_px = newTick->price();
 
 	/*
@@ -957,8 +1162,22 @@ void CtaMocker::handle_tick(const char* stdCode, WTSTickData* newTick, uint32_t 
 	
 	
 	_price_map[stdCode] = cur_px;
+	// 决策模型稍后从 _ticks 读取当前盘口；先更新缓存，不能读上一条报价。
 	_ticks[stdCode] = newTick->getTickStruct();
+	if (dynamic_cast<VolumeLimitedFill*>(_fill_model.get()) != nullptr)
+	{
+		// 只有显式启用 volume_limited 才做成交量校验；Legacy/Causal 不增添开销。
+		// 每条输入 Tick 只验证一次；同一事件的前后两次 proc_tick 共用结果。
+		const WTSTickStruct& tick = _ticks[stdCode];
+		// WT 样本中 total_volume 是截至当前的交易日内累计量；volume 是从上一条
+		// Tick 到当前 Tick 新增的量。observe 用累计量差分核对它，不合格返回 0。
+		// 模拟 Bar 生成的 Tick 不能被当成真实盘口/真实市场增量，直接给 0。
+		_event_volumes[stdCode] = _replayer->is_tick_simulated() ? 0.0
+			: _tick_volume_sources[stdCode].observe(tick.trading_date,
+				tick.total_volume, tick.volume);
+	}
 
+	// 第一轮先检查旧目标/条件：例如上一 Tick 剩余的 3 手可在本 Tick 尝试。
 	//先检查是否要信号要触发
 	//By Wesley @ 2022.04.19
 	//虽然这段逻辑下面也根据isBarEnd复制了一段
@@ -966,6 +1185,7 @@ void CtaMocker::handle_tick(const char* stdCode, WTSTickData* newTick, uint32_t 
 	proc_tick(stdCode, last_px, cur_px);
 
 	_in_tick_callback = true;
+	// 策略回调可以创建或覆盖目标；_in_tick_callback 仅标记它的来源。
 	on_tick_updated(stdCode, newTick);
 	_in_tick_callback = false;
 
@@ -977,8 +1197,25 @@ void CtaMocker::handle_tick(const char* stdCode, WTSTickData* newTick, uint32_t 
 	 *	这样做的目的是为了让在模拟tick触发的ontick中下单的信号能够正常处理
 	 *	而不至于在回测的时候成交价偏离太远
 	 */
+	// 第二轮沿用同一个事件序号和已用预算：不能把一条 Tick 当成两条行情。
+	// 新在本轮策略回调中创建的目标，因果模型要求等下一条 Tick 才能成交；
+	// 旧目标若尚未完成，也只能使用本 Tick 尚未消费的预算。
 	if(pxType != 3)
 		proc_tick(stdCode, last_px, cur_px);
+	// 两轮 proc_tick 和策略回调均完成后才取权益快照。net_pnl 不含任意假设的
+	// 初始资金：已实现盈亏 + 当前浮盈 - 累计费用。Day21 报告另加固定分母。
+	const WTSTickStruct& input = newTick->getTickStruct();
+	const double net_pnl = _fund_info._total_profit + _fund_info._total_dynprofit
+		- _fund_info._total_fees;
+	const auto pos = _pos_map.find(stdCode);
+	const double actual = pos == _pos_map.end() ? 0.0 : pos->second._volume;
+	const auto pending = _sig_map.find(stdCode);
+	const double target = pending == _sig_map.end() ? actual : pending->second._pending.target();
+	// 事件末尾同时记录目标与实际仓位，Day21 可直接计算每 Tick 的跟踪偏差。
+	// 没有待成交信号时，已实现的实际仓位就是最近目标，不虚构缺口。
+	_equity_event_logs << fmt::format("{},{},{},{},{:.2f},{},{},{}\n", stdCode,
+		input.action_date, input.action_time, current_event_sequence(stdCode), net_pnl,
+		target, actual, abs(target - actual));
 }
 
 
@@ -1005,6 +1242,10 @@ void CtaMocker::on_bar(const char* stdCode, const char* period, uint32_t times, 
 void CtaMocker::on_init()
 {
 	_ticks.clear();
+	// 每次新回测从空的行情基线、预算账本开始，不继承上一轮实验的日内状态。
+	_volume_ledgers.clear();
+	_tick_volume_sources.clear();
+	_event_volumes.clear();
 	_in_backtest = true;
 	if (_strategy)
 		_strategy->on_init(this);
@@ -1294,7 +1535,7 @@ void CtaMocker::enum_position(FuncEnumCtaPosCallBack cb, bool bForExecute)
 	{
 		const char* stdCode = sit.first.c_str();
 		const SigInfo& sInfo = sit.second;
-		desPos[stdCode] = sInfo._volume;
+		desPos[stdCode] = sInfo._pending.target();
 	}
 
 	for (auto v : desPos)
@@ -1576,9 +1817,16 @@ void CtaMocker::stra_set_position(const char* stdCode, double qty, const char* u
 	}
 
 	double total = stra_get_position(stdCode, false);
-	//如果目标仓位和当前仓位是一致的，直接退出
+	// 只有“不存在不同的待成交目标”时，同值设置才可忽略。部分成交后，
+	// 实际仓位可能是 7、旧目标仍为 10；此时 set_position(7) 必须进入
+	// append_signal 取消剩余 3 手，不能因 qty==actual 提前返回。
 	if (decimal::eq(total, qty))
-		return;
+	{
+		const auto pending = _sig_map.find(stdCode);
+		if (pending == _sig_map.end()
+			|| decimal::eq(pending->second._pending.target(), qty))
+			return;
+	}
 
 	if(commInfo->isT1())
 	{
@@ -1629,15 +1877,35 @@ void CtaMocker::append_signal(const char* stdCode, double qty, const char* userT
 {
 	double curPx = _price_map[stdCode];
 
+	// _sig_map 以合约为键，不建立一串独立订单；再次设置同合约目标会更新最新意图。
+	const auto previous = _sig_map.find(stdCode);
+	const bool replaces_pending = previous != _sig_map.end()
+		&& !decimal::eq(previous->second._pending.target(), qty);
+	const double old_target = replaces_pending ? previous->second._pending.target() : 0.0;
 	SigInfo& sInfo = _sig_map[stdCode];
-	sInfo._volume = qty;
+	const auto pos = _pos_map.find(stdCode);
+	const double actual = pos == _pos_map.end() ? 0.0 : pos->second._volume;
+	if (replaces_pending)
+	{
+		// 旧目标尚未成交的量在覆盖时失效；这里只记录事实，不重复计为成交。
+		// 例如目标 10 已成交 7，改目标 7，则 old_remaining=3。
+		_target_replacement_logs << fmt::format("{},{},{},{},{},{},{}\n", stdCode,
+			current_event_sequence(stdCode),
+			(uint64_t)_replayer->get_date() * 1000000000
+				+ (uint64_t)_replayer->get_raw_time() * 100000 + _replayer->get_secs(),
+			old_target, qty, actual, abs(old_target - actual));
+	}
+	// 真值始终是“最新目标”与“实际仓位”；例如目标 10 已成交 7，剩余是 3。
+	// 同值重复信号保留激活时钟；tag-only 变化仅更新标签，
+	// 不视为新的交易意图，也不能重新领取当下 Tick 的预算。
+	sInfo._pending.on_target(stdCode, qty, actual, current_event_sequence(stdCode));
 	sInfo._sigprice = curPx;
 	sInfo._desprice = price;
 	sInfo._usertag = userTag;
 	sInfo._gentime = (uint64_t)_replayer->get_date() * 1000000000 + (uint64_t)_replayer->get_raw_time() * 100000 + _replayer->get_secs();
 	sInfo._sigtype = sigType;
-	// 每个合约只保留最新目标；覆盖旧目标时同时重置因果计时起点。
-	sInfo._created_sequence = _event_sequence;
+	// 同事件多次不同目标只保留最后一个；不同合约各有独立状态。
+	// 来源只用于解释目标是在调度、策略 Tick 回调还是条件触发时产生。
 	sInfo._source = sigType == 2 ? SignalSource::Condition
 		: (_is_in_schedule ? SignalSource::Schedule
 		: (_in_tick_callback ? SignalSource::StrategyTick : SignalSource::Other));
@@ -1647,7 +1915,9 @@ void CtaMocker::append_signal(const char* stdCode, double qty, const char* userT
 	//save_data();
 }
 
-// 消费已生成的目标仓位信号时调用。模型只决定是否成交及 touch 基准价；
+// 消费已生成的目标仓位信号时调用。可以把本函数理解为“决策与记账的桥”：
+// 先从实际仓位、最新目标、事件/盘口/量源组成 FillRequest，再交给模型判断。
+// 模型只决定是否成交、本次有符号成交量和 touch 基准价；
 // 原版交易明细、费用、静态滑点和资金处理仍留在 apply_fill。
 FillStatus CtaMocker::do_set_position(const char* stdCode, double qty, double price,
 	const char* userTag, uint64_t created_sequence, SignalSource source)
@@ -1663,6 +1933,7 @@ FillStatus CtaMocker::do_set_position(const char* stdCode, double qty, double pr
 	uint32_t curTDate = _replayer->get_trading_date();
 
 	// 把最新目标和本次回放事件传给模型；时间使用逻辑序号，不用墙钟。
+	// qty 是目标总仓位，不是本次一定要成交的量；pInfo._volume 才是实际仓位。
 	FillRequest request;
 	request.actual_position = pInfo._volume;
 	request.target_position = qty;
@@ -1670,10 +1941,22 @@ FillStatus CtaMocker::do_set_position(const char* stdCode, double qty, double pr
 	request.created_sequence = created_sequence;
 	request.source = source;
 	request.market.code = stdCode;
-	request.market.event_sequence = _event_sequence;
+	const uint64_t event_sequence = current_event_sequence(stdCode);
+	request.market.event_sequence = event_sequence;
 	request.market.trading_date = curTDate;
+	// 同一合约、交易日、事件的预算账本只初始化一次；两次 proc_tick 共用。
+	// 对 Legacy/Causal，volume_ledger 始终为空，旧模型不受参与率机制影响。
+	CtaEventVolumeLedger* volume_ledger = nullptr;
+	if (dynamic_cast<VolumeLimitedFill*>(_fill_model.get()) != nullptr)
+	{
+		volume_ledger = &_volume_ledgers[stdCode];
+		volume_ledger->begin(curTDate, event_sequence);
+		// 第一次尝试通常为 0；同 Tick 第二次尝试会看到第一次实际用掉的量。
+		request.market.volume_used = volume_ledger->used();
+	}
 	// _ticks 在 handle_tick 开头更新。模拟 Bar 的 Tick 即使带了合成报价，
 	// 也不能把它当成真实盘口；因果模型将返回 NoQuote，绝不回退 last。
+	// bidqty1/askqty1 虽传给快照，目前不参与 volume_limited 的预算计算。
 	auto tick_it = _ticks.find(stdCode);
 	if (tick_it != _ticks.end())
 	{
@@ -1681,14 +1964,64 @@ FillStatus CtaMocker::do_set_position(const char* stdCode, double qty, double pr
 		request.market.last = tick.price;
 		if (!_replayer->is_tick_simulated())
 		{
+			// 因果模型买取 ask1、卖取 bid1；若真实盘口缺档则继续等待。
 			request.market.bid1 = tick.bid_prices[0];
 			request.market.ask1 = tick.ask_prices[0];
 			request.market.bidqty1 = tick.bid_qty[0];
 			request.market.askqty1 = tick.ask_qty[0];
-			request.market.volume_delta = tick.volume;
+			if (volume_ledger != nullptr)
+				// 这是经累计量核对的“当前 Tick 增量”，不是 total_volume 全日累计量。
+				request.market.volume_delta = _event_volumes[stdCode];
 		}
 	}
-	const FillResult fill = _fill_model->decide(request);
+	FillResult fill = _fill_model->decide(request);
+	// Legacy 保持原 apply_fill 的价格路径；新增模型则在会计记账前统一完成
+	// touch -> 滑点 -> tick 对齐 -> 涨跌停检查。拒绝价绝不能先改仓位。
+	if (fill.status == FillStatus::Filled && _fill_model_name != "legacy_cta")
+	{
+		WTSCommodityInfo* commInfo = _replayer->get_commodity_info(stdCode);
+		if (commInfo == NULL)
+		{
+			fill.status = FillStatus::InvalidInput;
+			fill.signed_delta = 0.0;
+		}
+		else
+		{
+			CtaPriceRequest price_request;
+			price_request.touch_price = fill.base_price;
+			price_request.price_tick = commInfo->getPriceTick();
+			price_request.slippage = static_cast<double>(_slippage);
+			price_request.ratio_slippage = _ratio_slippage;
+			price_request.is_buy = fill.signed_delta > 0.0;
+			if (tick_it != _ticks.end())
+			{
+				price_request.lower_limit = tick_it->second.lower_limit;
+				price_request.upper_limit = tick_it->second.upper_limit;
+			}
+			const CtaPriceResult priced = CtaPricePolicy::calculate(price_request);
+			if (priced.status == FillStatus::Filled)
+			{
+				fill.execution_price = priced.execution_price;
+				fill.execution_price_ready = true;
+			}
+			else
+			{
+				fill.status = priced.status;
+				fill.signed_delta = 0.0;
+			}
+		}
+	}
+	// 饱和计算只用于审计；真正的门槛在 CausalTouchFill::decide 中用减法比较，
+	// 不会因 created_seq + 1 + delay 的 uint64 溢出而提前激活。
+	const uint64_t max_seq = std::numeric_limits<uint64_t>::max();
+	const uint64_t activation_seq = created_sequence >= max_seq - _fill_delay_events
+		? max_seq : created_sequence + 1 + _fill_delay_events;
+	_fill_decision_logs << stdCode << "," << _fill_model_name << "," << event_sequence
+		<< "," << created_sequence << "," << activation_seq << ","
+		<< cta_fill_status_name(fill.status) << "," << qty << "," << pInfo._volume
+		<< "," << request.market.volume_delta << "," << request.market.volume_used
+		<< "," << fill.base_price << ","
+		<< (fill.execution_price_ready ? fill.execution_price : 0.0) << "\n";
 
 	// 仓位在 decimal::eq 容差内不变，沿用原版“直接返回、不记账”的处理。
 	if (fill.status == FillStatus::NoChange)
@@ -1699,30 +2032,68 @@ FillStatus CtaMocker::do_set_position(const char* stdCode, double qty, double pr
 		log_error("invalid CTA fill input for {}", stdCode);
 		return fill.status;
 	}
+	// 延迟、缺报价、零预算等都不调用 apply_fill：不产生成交与手续费。
+	// 外层 proc_tick 将保留待成交目标，等下一事件重新计算 remaining。
 	if (fill.status != FillStatus::Filled)
 		return fill.status;
 
 	// 决策只给出有符号差额和基准价；真正的成交、滑点和会计副作用在下方。
-	apply_fill(stdCode, qty, userTag, curTm, curTDate, fill);
+	// 只把本次有符号成交增量交给旧会计路径；Legacy/Causal 的增量仍是完整差额。
+	// 例：实际 0、目标 10、预算 7 -> signed_delta=+7，传给 apply_fill 的 qty=7。
+	// 若这里误传目标 10，费用、交易 CSV 与仓位都会虚增 3 手。
+	const double actual_before = pInfo._volume;
+	const double actual_after = actual_before + fill.signed_delta;
+	const double final_price = apply_fill(stdCode, actual_after, userTag, curTm, curTDate, fill);
+	const double applied_delta = pInfo._volume - actual_before;
+	if (!decimal::eq(applied_delta, 0.0) && std::isfinite(final_price))
+	{
+		// 成本仅按实际成交数量统计。spread 以当前买卖一档中点为基准，
+		// extra 以 touch 为基准；last 单列作观察价，不能冒充盘口中点。
+		const double direction = applied_delta > 0.0 ? 1.0 : -1.0;
+		const double scale = _replayer->get_commodity_info(stdCode)->getVolScale();
+		const double magnitude = std::abs(applied_delta) * scale;
+		const bool has_mid = _fill_model_name != "legacy_cta"
+			&& request.market.bid1 > 0.0 && request.market.ask1 > 0.0;
+		const double mid = has_mid ? (request.market.bid1 + request.market.ask1) / 2.0 : 0.0;
+		const double spread_cost = has_mid
+			? direction * (fill.base_price - mid) * magnitude : 0.0;
+		const double extra_cost = direction * (final_price - fill.base_price) * magnitude;
+		_fill_audit_logs << stdCode << "," << _fill_model_name << "," << curTm
+			<< "," << event_sequence << "," << created_sequence << "," << qty
+			<< "," << actual_before << "," << pInfo._volume << "," << applied_delta
+			<< "," << request.market.last << ",";
+		if (has_mid)
+			_fill_audit_logs << mid;
+		_fill_audit_logs << "," << fill.base_price << "," << final_price << ",";
+		if (has_mid)
+			_fill_audit_logs << spread_cost;
+		_fill_audit_logs << "," << extra_cost << "\n";
+	}
+	if (volume_ledger != nullptr)
+		// 必须以记账后的真实仓位差额扣预算；不能只按模型建议量扣。
+		volume_ledger->consume(std::abs(pInfo._volume - actual_before));
 	return fill.status;
 }
 #pragma region apply_fill
 // 这一段由原 do_set_position 的记账主体抽出，仍维持原分支和计算顺序。
 // Filled 表示“回测中准备按此数量立即记账”，不是外部交易通道的成交回报。
-// 本函数仍直接把 pInfo._volume 设成完整目标 qty，尚不支持部分成交。
-void CtaMocker::apply_fill(const char* stdCode, double qty, const char* userTag,
+// qty 是本次成交后的仓位而非策略最终目标；部分成交后 pending 仍保存原目标。
+// 这里沿用原版会计实现，Day16 不另外写一套资金/手续费/开平仓逻辑。
+double CtaMocker::apply_fill(const char* stdCode, double qty, const char* userTag,
 	uint64_t curTm, uint32_t curTDate, const FillResult& fill)
 {
 	PosInfo& pInfo = _pos_map[stdCode];
 	// 与原版相同：找不到合约品种信息就无法获得价格跳动、乘数和费率，直接返回。
 	WTSCommodityInfo* commInfo = _replayer->get_commodity_info(stdCode);
 	if (commInfo == NULL)
-		return;
+		return std::numeric_limits<double>::quiet_NaN();
 
 	// 从模型传回的基准价起算；下面按买卖方向叠加滑点得到最终记账价。
-	double trdPx = fill.base_price;
+	double trdPx = fill.execution_price_ready ? fill.execution_price : fill.base_price;
 
 	// 差额为正表示买入，为负表示卖出；它尚未区分“开”还是“平”。
+	// volume_limited 已将 abs(diff) 裁剪到本 Tick 剩余预算；之后所有记录
+	// 都必须使用这个 diff，而不能重新使用策略目标与旧仓位的完整差额。
 	double diff = fill.signed_delta;
 	bool isBuy = decimal::gt(diff, 0.0);
 	// 仅旧仓非零且增量与旧仓同向时走加仓分支。
@@ -1741,7 +2112,7 @@ void CtaMocker::apply_fill(const char* stdCode, double qty, const char* userTag,
 		
 		// 固定滑点按价格跳动数计算；比例滑点按万分比计算后修正到价格跳动。
 		// 买入抬高记账价、卖出压低记账价；模型自身尚未处理滑点。
-		if (_slippage != 0)
+		if (_slippage != 0 && !fill.execution_price_ready)
 		{
 			if (_ratio_slippage)
 			{
@@ -1782,7 +2153,7 @@ void CtaMocker::apply_fill(const char* stdCode, double qty, const char* userTag,
 		// left 是尚未分配的绝对成交量；空仓开仓时没有旧明细可平。
 		double left = abs(diff);
 		// 减仓、平仓、反手也只对同一个基准价应用一次原版滑点。
-		if (_slippage != 0)
+		if (_slippage != 0 && !fill.execution_price_ready)
 		{
 			if (_ratio_slippage)
 			{
@@ -1853,6 +2224,8 @@ void CtaMocker::apply_fill(const char* stdCode, double qty, const char* userTag,
 		}
 
 		// 抵扣旧明细后仍有余量时开新仓：既覆盖反手，也覆盖从空仓开仓。
+		// 例如旧仓 +3、目标 -4、本次只能卖 3：left 在平完旧多仓后为 0，
+		// 当前事件不会越过零仓直接开空；下一事件再由最新 actual 重算差额。
 		// 新仓继续使用上面已经加过滑点的 trdPx，不会再次叠加滑点。
 		if (left > 0)
 		{
@@ -1885,6 +2258,7 @@ void CtaMocker::apply_fill(const char* stdCode, double qty, const char* userTag,
 			pInfo._last_entertime = curTm;
 		}
 	}
+	return trdPx;
 }
 
 WTSKlineSlice* CtaMocker::stra_get_bars(const char* stdCode, const char* period, uint32_t count, bool isMain /* = false */)
@@ -2117,11 +2491,14 @@ double CtaMocker::stra_get_position(const char* stdCode, bool bOnlyValid /* = fa
 {
 	//By Wesley @ 2022.05.22
 	//如果有信号，说明刚下了指令，还没等到下一个tick进来，用户就在读取仓位
+	// 注意：如果还没有建立该合约的 PosInfo，此接口会先返回待成交目标，
+	// 这是旧接口的即时读数语义，不能据此认定目标已真正成交。
+	// 一旦 _pos_map 已建立，下方返回 pInfo._volume，实际成交应以 trades.csv 核实。
 	double totalPos = 0;
 	auto sit = _sig_map.find(stdCode);
 	if (sit != _sig_map.end())
 	{
-		totalPos = sit->second._volume;
+		totalPos = sit->second._pending.target();
 	}
 
 	auto it = _pos_map.find(stdCode);

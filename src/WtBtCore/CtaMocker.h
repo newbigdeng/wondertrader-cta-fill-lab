@@ -67,6 +67,9 @@ typedef wt_hashmap<std::string, CondList>	CondEntrustMap;
 
 class CtaMocker : public ICtaStraCtx, public IDataSink
 {
+// CtaMocker 是回测中的策略上下文和会计执行者：保存最新目标、实际持仓，
+// 接收回放 Tick，调用成交模型后再写成交、费用、盈亏等。
+// 成交模型只回答“此刻能成交多少、以哪个未加滑点的基准价”，不能自行改账。
 public:
 	CtaMocker(HisDataReplayer* replayer, const char* name, int32_t slippage = 0, bool persistData = true, EventNotifier* notifier = NULL, bool isRatioSlp = false);
 	virtual ~CtaMocker();
@@ -82,24 +85,32 @@ private:
 
 	void	update_dyn_profit(const char* stdCode, double price);
 
-	// 信号消费入口：把目标创建序号、来源和当前 Tick 盘口交给模型。
-	// WaitingLatency/NoQuote/InvalidMarketData 不记账，调用者保留信号继续等待。
+	// 每次 proc_tick 尝试消费一个目标时进入此函数：
+	// 1. 从 _pos_map 取实际仓位，从 _sig_map 取待完成目标；
+	// 2. 组织 FillRequest，包括本 Tick 盘口、经核验的市场增量和已用预算；
+	// 3. 调用 _fill_model->decide；Filled 时只按 signed_delta 记本次成交。
+	// WaitingLatency/NoQuote/NoLiquidity/InvalidMarketData 不记账，调用者保留信号继续等待。
 	FillStatus do_set_position(const char* stdCode, double qty, double price,
 		const char* userTag, uint64_t created_sequence, SignalSource source);
 	// 保留旧 do_set_position 的会计流程：开平拆分、滑点、费用、盈亏、持仓与日志。
-	// 当前仍按完整目标 qty 更新仓位，因此仅替换决策类还不能支持部分成交。
-	void	apply_fill(const char* stdCode, double qty, const char* userTag,
+	// qty 是“实际旧仓位 + 本次成交增量”，不是策略期望的最终目标。
+	// 例如当前 0、目标 10、本次成交 7：这里必须传 7，不能传 10。
+	double	apply_fill(const char* stdCode, double qty, const char* userTag,
 		uint64_t curTm, uint32_t curTDate, const FillResult& fill);
 	void	append_signal(const char* stdCode, double qty, const char* userTag, double price, uint32_t sigType);
 
 	inline CondList& get_cond_entrusts(const char* stdCode);
 
 	void	proc_tick(const char* stdCode, double last_px, double cur_px);
+	uint64_t current_event_sequence(const char* stdCode) const;
 
 public:
 	bool	init_cta_factory(WTSVariant* cfg);
 	// 仅供 C++ 内部配置和 YAML 的 cta.model 使用；默认仍为 legacy_cta。
-	bool	configure_fill_model(const char* model, uint64_t delay_events = 0);
+	// volume_limited 需要 (0,1] 的 participation_rate；旧模型不接受非零 rate。
+	// 切换模型时清空量源和预算账本，防止上一种模型的状态渗入新实验。
+	bool	configure_fill_model(const char* model, uint64_t delay_events = 0,
+		double participation_rate = 0.0);
 	void	load_incremental_data(const char* lastBacktestName);
 	void	install_hook();
 	void	enable_hook(bool bEnabled = true);
@@ -258,9 +269,21 @@ protected:
 	int32_t			_slippage;			//成交滑点， 如果是比例滑点，则为万分比
 	bool			_ratio_slippage;	//是否比例滑点
 	// 模型由上下文独占，且只在配置时构造，不会在每个 Tick 上分配。
+	// 默认 Legacy；只有显式选 volume_limited，以下三个按合约分组的表才会参与撮合。
 	std::unique_ptr<ICtaFillModel> _fill_model;
-	uint64_t _event_sequence = 0; // 每次 handle_tick 增一次；同事件双 proc_tick 不重复增
-	bool _in_tick_callback = false; // 仅用于标记 append_signal 的来源
+	std::string _fill_model_name = "legacy_cta"; // 用于可审计输出，避免根据类型名猜配置
+	uint64_t _fill_delay_events = 0;
+	uint64_t _event_sequence = 0; // 兼容旧状态文件的全局计数；Legacy 仍沿用
+	// 新增模型的延迟按合约自己的输入 Tick 计数，其他合约不能替它推进时钟。
+	std::unordered_map<std::string, uint64_t> _contract_event_sequences;
+	// stdCode -> 当前 Tick 已实际成交的手数；同 Tick 双 proc_tick 不会重复领预算。
+	std::unordered_map<std::string, CtaEventVolumeLedger> _volume_ledgers;
+	// stdCode -> 上条真实 Tick 的日内累计量及交易日；用于校验 volume 字段。
+	std::unordered_map<std::string, CtaTickVolumeSource> _tick_volume_sources;
+	std::unordered_map<std::string, CtaTickInputGuard> _tick_input_guards;
+	// stdCode -> 当前 Tick 校验后的新增市场量；一次 handle_tick 只计算一次。
+	std::unordered_map<std::string, double> _event_volumes;
+	bool _in_tick_callback = false; // 标记目标是否由 on_tick_updated 生成，以审计因果时序
 
 	uint32_t		_schedule_times;	//调度次数
 
@@ -333,23 +356,21 @@ protected:
 
 	typedef struct _SigInfo
 	{
-		double		_volume;
+		// 同合约只保留最新目标，覆盖旧目标；部分成交后的剩余量随实际仓位重算。
+		CtaPendingTarget _pending;
 		std::string	_usertag;
-		double		_sigprice;
-		double		_desprice;
+		double		_sigprice; // 记录信号生成时的行情价，用于信号输出/审计
+		double		_desprice; // 非零时作为指定触发基准价；因果模型仍用真实 touch 价
 		uint32_t	_sigtype;
 		uint64_t	_gentime;
-		uint64_t	_created_sequence; // 最新目标的回放事件序号，非墙钟
 		SignalSource _source;        // 产生目标的回调/条件来源
 
 		_SigInfo()
 		{
-			_volume = 0;
 			_sigprice = 0;
 			_desprice = 0;
 			_sigtype = 0;
 			_gentime = 0;
-			_created_sequence = 0;
 			_source = SignalSource::Unknown;
 		}
 	}SigInfo;
@@ -361,6 +382,10 @@ protected:
 	std::stringstream	_fund_logs;
 	std::stringstream	_sig_logs;
 	std::stringstream	_pos_logs;
+	std::stringstream _fill_decision_logs; // 每次目标尝试的因果/预算/状态
+	std::stringstream _fill_audit_logs;    // 只记录实际记账的成交增量与成本分解
+	std::stringstream _equity_event_logs;  // 每条有效 Tick 后的模拟净盈亏，用于窗口回撤
+	std::stringstream _target_replacement_logs; // 旧目标被新目标覆盖时尚未成交的数量
 	std::stringstream	_index_logs;
 	std::stringstream	_mark_logs;
 

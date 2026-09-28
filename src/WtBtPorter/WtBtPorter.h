@@ -45,6 +45,16 @@ extern "C"
 
 	EXPORT_FLAG	CtxHandler	init_cta_mocker(const char* name, int slippage = 0, bool hook = false, bool persistData = true, bool bIncremental = false, bool bRatioSlp = false);
 
+	// 新入口追加模型参数，旧 init_cta_mocker 的 ABI 保持不变。
+	// 配置失败返回 0，且不会注册回测上下文。
+	EXPORT_FLAG	CtxHandler	init_cta_mocker_v2(const char* name, int slippage, bool hook,
+		bool persistData, bool bIncremental, bool bRatioSlp, const char* fillModel, WtUInt64 eventDelay);
+
+	// Day16：仅追加参与率参数；旧 v1/v2 符号和签名保持不变。
+	EXPORT_FLAG	CtxHandler	init_cta_mocker_v3(const char* name, int slippage, bool hook,
+		bool persistData, bool bIncremental, bool bRatioSlp, const char* fillModel,
+		WtUInt64 eventDelay, double participationRate);
+
 	EXPORT_FLAG	CtxHandler	init_hft_mocker(const char* name, bool hook = false);
 
 	EXPORT_FLAG	CtxHandler	init_sel_mocker(const char* name, WtUInt32 date, WtUInt32 time, const char* period, const char* trdtpl = "CHINA", const char* session = "TRADING", int slippage = 0, bool bRatioSlp = false);
