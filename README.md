@@ -6,7 +6,7 @@
 
 先看实盘/仿真盘。行情接口收到数据后，`ParserAdapter` 统一代码并交给引擎；引擎驱动策略、汇总目标仓位，再把目标交给执行器。执行单元决定报单节奏和价格，`TraderAdapter` 管交易通道的订单、持仓和资金状态。末端接真实交易接口就是实盘，接 `TraderMocker` 就是本地仿真撮合。两者共用上面的执行链。
 
-![WT 原版实盘与仿真盘主链路](images/wt-live-sim-architecture.png)
+![WT 原版实盘与仿真盘主链路](images/wt-live-sim-architecture-zh.png)
 
 图里把跨层调用压成了三行，省略了订单/成交回报箭头：回报会返回 `TraderAdapter`，再通知执行器。`TraderMocker` 的撮合逻辑在它自身及其配套实现里，图中的“Local simulated matching”不是另一套独立服务。数据中台 `WtDtCore`/`WtDtServo`、历史存储 `WtDataStorage`、Python 桥接 `WtPorter`/`WtRtRunner`，以及 `EventNotifier`/`WtMsgQue` 到 wtpy 监控端，是旁路或可选部署，不是每个 Tick 必经的主链。
 
@@ -18,7 +18,7 @@ CTA 回测走另一条链：`HisDataReplayer` 回放历史数据，`CtaMocker` �
 
 我改动的部分在 CTA 回测路径上。下图只画与这次改动有关的节点，省略了其他策略引擎和实盘执行链；`CtaFillModel` 给出成交决策，实际改仓位、记账和写 CSV 仍由 `CtaMocker` 完成。
 
-![本仓库 CTA 回测成交路径](images/cta-backtest-architecture.png)
+![本仓库 CTA 回测成交路径](images/cta-backtest-architecture-zh.png)
 
 ## 我改了什么
 
