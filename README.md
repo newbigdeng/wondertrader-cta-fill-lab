@@ -6,9 +6,11 @@
 
 先看实盘/仿真盘。行情接口收到数据后，`ParserAdapter` 统一代码并交给引擎；引擎驱动策略、汇总目标仓位，再把目标交给执行器。执行单元决定报单节奏和价格，`TraderAdapter` 管交易通道的订单、持仓和资金状态。末端接真实交易接口就是实盘，接 `TraderMocker` 就是本地仿真撮合。两者共用上面的执行链。
 
-![WT 原版实盘与仿真盘主链路](images/wt-live-sim-architecture-zh.png)
+![WT 原版实盘与仿真盘架构：行情、CTA 执行、数据中台和监控](images/wt-live-sim-architecture-bilingual.png)
 
-图里把跨层调用压成了三行，省略了订单/成交回报箭头：回报会返回 `TraderAdapter`，再通知执行器。`TraderMocker` 的撮合逻辑在它自身及其配套实现里，图中的“Local simulated matching”不是另一套独立服务。数据中台 `WtDtCore`/`WtDtServo`、历史存储 `WtDataStorage`、Python 桥接 `WtPorter`/`WtRtRunner`，以及 `EventNotifier`/`WtMsgQue` 到 wtpy 监控端，是旁路或可选部署，不是每个 Tick 必经的主链。
+图分成四条线。第二条以 CTA 为例；HFT、SEL 并不一定走相同的执行器路径。图里省略了订单/成交回报的反向箭头：回报先回到 `TraderAdapter`，再通知执行器；`TraderMocker` 自身负责本地模拟撮合，不是另一套独立服务。
+
+数据中台是按需部署的另一条行情链：`WtDtCore` 接收、广播行情并通过 `WtDataStorage` 写历史数据，`WtDtServo` 提供数据读取；若用 UDP 广播接入实盘，可走 `UDPCaster → ParserUDP → ParserAdapter`。消息路线则从引擎和交易通道经 `EventNotifier`、`WtMsgQue` 到 wtpy 的事件接收与监控端。Python 策略通过 `WtPorter`/`WtRtRunner` 接入引擎。这些路径不是每个 Tick 都要依次经过的单条流水线。
 
 这里的“组合管理”主要指引擎汇总多策略目标、路由到执行器；资金盈亏记账在引擎，交易账户资金状态在 `TraderAdapter`。原版已有过滤、仓位缩放和风险监控等机制，但不应把它们理解为独立的通用风控服务。[原版实盘架构图](images/prod_struture.png)也保留在仓库里。
 
