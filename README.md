@@ -1,6 +1,12 @@
-# WonderTrader CTA 回测成交模型
+# WonderTrader：CTA 成交模型与模拟盘验证
 
-这个仓库是在 [WonderTrader 原版](https://github.com/wondertrader/wondertrader) 上做的二次开发，不是 WT 官方仓库。WT 原有的行情、策略引擎、执行器、交易通道和回测框架都来自原项目。我改的是 **CTA 回测里目标仓位到模拟成交** 这一段，以及围绕它做的测试。Python 侧的改动在 [wtpy-cta-fill-lab](https://github.com/newbigdeng/wtpy-cta-fill-lab)。
+这个仓库是在 [WonderTrader 原版](https://github.com/wondertrader/wondertrader) 上做的二次开发，不是 WT 官方仓库。
+
+原版 WonderTrader（WT）是以 C++ 为核心的开源量化研发与交易框架，覆盖行情接入与存储、策略开发、历史回测、组合与执行管理、交易通道和运行监控。它提供 CTA、HFT、SEL、UFT 等策略引擎，并通过 [wtpy](https://github.com/wondertrader/wtpy) 向 Python 提供策略、数据和监控接口。
+
+WT 原有的行情、策略引擎、执行器、交易通道和回测框架都来自原项目。本仓库目前主要做两件事：改造 **CTA 回测里目标仓位到模拟成交** 的规则并测试；运行 **纯 C++ 本地模拟盘**，核对业务链路、记录问题并逐步修复。模拟盘工作尚未完成，会持续更新。Python 侧的成交模型接口改动在 [wtpy-cta-fill-lab](https://github.com/newbigdeng/wtpy-cta-fill-lab)。
+
+项目文档分为两个目录：[`docs/cta-fill`](docs/cta-fill/README.md) 介绍成交模型改造与测试，[`docs/sim`](docs/sim/README.md) 记录模拟盘链路、问题、处理过程和验证结果。
 
 ## 原版 WT 是怎么跑的
 
@@ -24,6 +30,8 @@ CTA 回测走另一条链：`HisDataReplayer` 回放历史数据，`CtaMocker` �
 
 ## 我改了什么
 
+### CTA 回测成交模型
+
 原来的 CTA 回测在处理目标仓位时，基本按目标与当前仓位的差额直接成交。这种做法很适合作基线，但没法观察“只成交一部分”会怎样影响后面的策略信号。我想保持策略不变、单独替换成交规则，于是把成交判断从 `CtaMocker` 中拆了出来，并留下保持原行为的 `LegacyCtaFill` 作对照。
 
 - `CausalTouchFill` 按事件顺序和对手盘报价判断能否成交。这个模型仍是全量成交；没有可用报价时不会编造一个成交价。
@@ -32,5 +40,17 @@ CTA 回测走另一条链：`HisDataReplayer` 回放历史数据，`CtaMocker` �
 - 增加成交决策、实际成交和目标覆盖的审计输出，并用单元测试、Legacy 输出对照和真实 Tick 回测检查数量、费用、反手与目标取消等边界。
 
 核心代码在 [`CtaFillModel.h`](src/WtBtCore/CtaFillModel.h)、[`CtaMocker.cpp`](src/WtBtCore/CtaMocker.cpp) 和 [`test_cta_fill_model.cpp`](src/TestUnits/test_cta_fill_model.cpp)。目前这些改动只用于 CTA 回测；模型里的“成交”是回测记账，不是交易所委托回报。
+
+模型规格、配置入口、测试结果及待解决边界见 [`docs/cta-fill`](docs/cta-fill/README.md)。
+
+### 本地模拟盘验证（持续更新）
+
+我还运行了原生 C++ 的本地模拟链路：人工 Tick 进入 `QuoteFactory`，经存储和 UDP 广播分别供给策略与 `TraderMocker`；CTA 目标通过执行器形成委托，再由模拟成交回报更新交易通道持仓。
+
+- 已完成两轮基线、最新价取价对照、三手分笔成交、持仓恢复和错误合约代码对照。委托、成交、持仓落盘及恢复的业务闭环已经跑通。
+- 已处理实验中的标准合约代码、累计行情续接和最小部署问题。核心程序可以运行，但原始 CMake 目标的可选插件打包问题仍待修复。
+- 已复现订单累计成交量为负、订单/成交日期为 0、策略资金快照滞后、首次 Tick 未转发，以及程序无法正常退出的问题。当前完成了复现和定位，尚未提交这些问题的源码修复。
+
+截至当前阶段，结论是“本地业务闭环通过，字段、快照和退出验收未全部通过”。后续修复、回归和新的实验结果会继续更新 [`docs/sim`](docs/sim/README.md) 及本节；当前没有接入 SimNow。
 
 原版项目：[WonderTrader](https://github.com/wondertrader/wondertrader) · [wtpy](https://github.com/wondertrader/wtpy)。本仓库保留原项目的 [MIT 许可](LICENSE) 与 Git 历史。
